@@ -1,9 +1,8 @@
 using System;
 using System.IO;
 using System.Net;
-using System.Web.Services.Protocols;
-using Blackbaud.AppFx.WebAPI;
-using Blackbaud.AppFx.WebAPI.ServiceProxy;
+using System.Text;
+using System.Xml;
 
 namespace InfinityAuthNiuTest
 {
@@ -14,57 +13,95 @@ namespace InfinityAuthNiuTest
             try
             {
                 var settings = LoadSettings();
-                var provider = CreateProvider(settings);
 
                 Console.WriteLine($"URL:      {settings.ServiceUrl}");
                 Console.WriteLine($"Database: {settings.Database}");
                 Console.WriteLine($"User:     {FormatUser(settings)}");
-                Console.WriteLine($"Auth:     Basic");
+                Console.WriteLine($"Auth:     Basic (preemptive)");
                 Console.WriteLine();
 
-                Console.WriteLine("Calling GetAvailableREDatabases...");
-                var req = provider.CreateRequest<GetAvailableREDatabasesRequest>();
-                var reply = provider.Service.GetAvailableREDatabases(req);
+                // Build SOAP envelope for DataListGetMetaData
+                var soapBody = BuildDataListGetMetaDataEnvelope(settings.Database);
 
-                if (reply.Databases == null || reply.Databases.Length == 0)
+                Console.WriteLine("Calling DataListGetMetaData (raw HTTP, preemptive Basic auth)...");
+                Console.WriteLine($"SOAPAction: Blackbaud.AppFx.WebService.API.1/DataListGetMetaData");
+                Console.WriteLine();
+
+                var request = (HttpWebRequest)WebRequest.Create(settings.ServiceUrl);
+                request.Method = "POST";
+                request.ContentType = "text/xml; charset=utf-8";
+                request.Headers.Add("SOAPAction", "\"Blackbaud.AppFx.WebService.API.1/DataListGetMetaData\"");
+
+                // Preemptive Basic auth — send credentials on first request, no challenge needed
+                var credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes(
+                    string.IsNullOrEmpty(settings.Domain)
+                        ? $"{settings.Username}:{settings.Password}"
+                        : $"{settings.Domain}\\{settings.Username}:{settings.Password}"));
+                request.Headers.Add("Authorization", $"Basic {credentials}");
+
+                var bodyBytes = Encoding.UTF8.GetBytes(soapBody);
+                request.ContentLength = bodyBytes.Length;
+                using (var stream = request.GetRequestStream())
+                    stream.Write(bodyBytes, 0, bodyBytes.Length);
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream()))
                 {
-                    Console.WriteLine("PASS - connected, but no databases returned.");
-                    return 0;
+                    var responseText = reader.ReadToEnd();
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"PASS - HTTP {(int)response.StatusCode} {response.StatusDescription}");
+                    Console.ResetColor();
+                    Console.WriteLine();
+                    Console.WriteLine("Response (first 2000 chars):");
+                    Console.WriteLine(responseText.Substring(0, Math.Min(2000, responseText.Length)));
                 }
 
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"PASS - {reply.Databases.Length} database(s):");
-                Console.ResetColor();
-                foreach (var db in reply.Databases)
-                    Console.WriteLine($"  {db}");
-
                 return 0;
-            }
-            catch (SoapException soapEx)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL - SOAP error: {soapEx.Message}");
-                Console.ResetColor();
-                return 1;
             }
             catch (WebException webEx)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.Write("FAIL - ");
                 if (webEx.Response is HttpWebResponse resp)
+                {
                     Console.WriteLine($"HTTP {(int)resp.StatusCode} {resp.StatusDescription}");
+                    using (var reader = new StreamReader(resp.GetResponseStream()))
+                        Console.WriteLine(reader.ReadToEnd().Substring(0, Math.Min(2000, (int)resp.ContentLength > 0 ? (int)resp.ContentLength : 2000)));
+                }
                 else
+                {
                     Console.WriteLine(webEx.Message);
+                }
                 Console.ResetColor();
                 return 1;
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL - {ex.Message}");
+                Console.WriteLine($"FAIL - {ex.GetType().Name}: {ex.Message}");
                 Console.ResetColor();
                 return 1;
             }
+        }
+
+        static string BuildDataListGetMetaDataEnvelope(string database)
+        {
+            // Minimal DataListGetMetaData request — just needs a valid DataListID
+            // Using a well-known list ID (constituent search) as a test
+            return $@"<?xml version=""1.0"" encoding=""utf-8""?>
+<soap:Envelope xmlns:soap=""http://schemas.xmlsoap.org/soap/envelope/""
+               xmlns:bb=""Blackbaud.AppFx.WebService.API.1"">
+  <soap:Body>
+    <bb:DataListGetMetaDataRequest>
+      <bb:ClientAppInfo
+        REDatabaseToUse=""{database}""
+        ClientAppName=""InfinityAuthNiuTest""
+        TimeOutSeconds=""30"" />
+      <bb:DataListID>846E0526-3B1E-4D4E-A973-1BE20ECB8288</bb:DataListID>
+    </bb:DataListGetMetaDataRequest>
+  </soap:Body>
+</soap:Envelope>";
         }
 
         static Settings LoadSettings()
@@ -80,23 +117,6 @@ namespace InfinityAuthNiuTest
             return new Settings(json);
         }
 
-        static AppFxWebServiceProvider CreateProvider(Settings settings)
-        {
-            var provider = new AppFxWebServiceProvider();
-            provider.Url = settings.ServiceUrl;
-            provider.Database = settings.Database;
-            provider.ApplicationName = "InfinityAuthNiuTest";
-
-            var cache = new CredentialCache();
-            cache.Add(new Uri(settings.ServiceUrl), "Basic",
-                string.IsNullOrEmpty(settings.Domain)
-                    ? new NetworkCredential(settings.Username, settings.Password)
-                    : new NetworkCredential(settings.Username, settings.Password, settings.Domain));
-            provider.Credentials = cache;
-
-            return provider;
-        }
-
         static string FormatUser(Settings settings)
         {
             return string.IsNullOrEmpty(settings.Domain)
@@ -105,9 +125,6 @@ namespace InfinityAuthNiuTest
         }
     }
 
-    /// <summary>
-    /// Minimal JSON settings reader — avoids Newtonsoft dependency.
-    /// </summary>
     class Settings
     {
         public string ServiceUrl { get; }

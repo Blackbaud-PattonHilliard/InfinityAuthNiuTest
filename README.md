@@ -1,6 +1,8 @@
 # InfinityAuthNiuTest
 
-Tests Basic authentication against a canary Infinity instance using the `Blackbaud.AppFx.WebAPI` library with NIU (Non Interactive User) credentials.
+Tests Basic authentication against a canary Infinity instance using raw HTTP with preemptive Basic auth and NIU (Non Interactive User) credentials.
+
+This app deliberately avoids the `Blackbaud.AppFx.WebAPI` library to isolate an authentication issue: `SoapHttpClientProtocol` uses challenge-response auth (waits for a 401 before sending credentials), which fails through App Gateway v2 because the gateway resets the TCP connection between handshake legs. Sending the `Authorization: Basic` header preemptively on the first request — as Postman does — works correctly.
 
 ## What is an NIU / Proxy User?
 
@@ -18,7 +20,7 @@ For full documentation, see: [CRM Service Pack 32 — Proxy User](https://webfil
 
 ## What This App Does
 
-Calls `GetAvailableREDatabases` via `AppFxWebServiceProvider` using Basic auth through a `CredentialCache` with NIU credentials.
+Sends a raw SOAP request (`DataListGetMetaData` for the Phones List) via `HttpWebRequest` with a preemptive `Authorization: Basic` header. No Blackbaud-specific DLLs are used — only standard .NET Framework classes.
 
 The `appsettings.json` `Username` field is the proxy user name and `Password` is the PAT.
 
