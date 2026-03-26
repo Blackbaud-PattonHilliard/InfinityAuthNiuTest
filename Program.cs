@@ -1,7 +1,13 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Web.Services.Protocols;
 using Blackbaud.AppFx.WebAPI;
 using Blackbaud.AppFx.WebAPI.ServiceProxy;
@@ -10,54 +16,136 @@ namespace InfinityAuthNiuTest
 {
     class Program
     {
+        static StreamWriter _log;
+
         static int Main(string[] args)
         {
             var settings = LoadSettings();
 
-            Console.WriteLine($"URL:      {settings.ServiceUrl}");
-            Console.WriteLine($"Database: {settings.Database}");
-            Console.WriteLine($"User:     {FormatUser(settings)}");
-            Console.WriteLine();
+            // When using a proxy (Fiddler), trust its HTTPS interception certificate
+            if (!string.IsNullOrEmpty(settings.ProxyUrl))
+            {
+                ServicePointManager.ServerCertificateValidationCallback =
+                    (object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) => true;
+            }
 
-            int result = 0;
+            var hostShort = new Uri(settings.ServiceUrl).Host.Split('.')[0];
+            var logName = $"niu-test-{hostShort}-{DateTime.Now:yyyyMMdd-HHmmss}.log";
+            var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, logName);
+            _log = new StreamWriter(logPath, append: true) { AutoFlush = true };
 
-            // Test 1: Raw HTTP with preemptive Basic auth
-            Console.WriteLine("════════════════════════════════════════════════════════════════");
-            Console.WriteLine("Test 1: Raw HTTP with preemptive Basic auth");
-            Console.WriteLine("════════════════════════════════════════════════════════════════");
-            result |= RunRawHttpTest(settings);
-            Console.WriteLine();
+            try
+            {
+                Log("════════════════════════════════════════════════════════════════");
+                Log("InfinityAuthNiuTest — Preemptive Basic Auth Test");
+                Log("════════════════════════════════════════════════════════════════");
+                Log($"URL:        {settings.ServiceUrl}");
+                Log($"Database:   {settings.Database}");
+                Log($"User:       {FormatUser(settings)}");
+                Log($"Auth:       Basic (preemptive)");
+                if (!string.IsNullOrEmpty(settings.ProxyUrl))
+                    Log($"Proxy:      {settings.ProxyUrl}");
+                Log($"Log:        {logPath}");
+                Log("");
 
-            // Test 2: WebAPI with PreemptiveBasicAuthProvider subclass
-            Console.WriteLine("════════════════════════════════════════════════════════════════");
-            Console.WriteLine("Test 2: WebAPI (PreemptiveBasicAuthProvider subclass)");
-            Console.WriteLine("════════════════════════════════════════════════════════════════");
-            result |= RunWebApiSubclassTest(settings);
+                // Network info
+                Log($"Public IP:   {GetPublicIp()}");
+                Log($"Local IPs:   {GetLocalIps()}");
+                Log($"Hostname:    {Dns.GetHostName()}");
 
-            return result;
+                // Resolve server IP
+                var serverHost = new Uri(settings.ServiceUrl).Host;
+                Log($"Server Host: {serverHost}");
+                Log($"Server IPs:  {ResolveHost(serverHost)}");
+
+                // ServicePoint info
+                var sp = ServicePointManager.FindServicePoint(new Uri(settings.ServiceUrl));
+                Log($"TLS:         {ServicePointManager.SecurityProtocol}");
+                Log($"Conn Limit:  {sp.ConnectionLimit}");
+                Log("");
+
+                // Capture server endpoint for source port lookups
+                var serverEndpoint = ResolveServerEndpoint(serverHost);
+
+                const int iterations = 10;
+                const int delaySeconds = 5;
+                int rawHttpPasses = 0, rawHttpFailures = 0;
+                int webApiPasses = 0, webApiFailures = 0;
+
+                Log($"Running {iterations} iterations with {delaySeconds}s delay between each");
+                Log("────────────────────────────────────────────────────────────────");
+                Log("");
+
+                for (int i = 1; i <= iterations; i++)
+                {
+                    Log($"── Iteration {i}/{iterations} ──");
+                    Log("");
+
+                    // Test 1: Raw HTTP
+                    Log("  Test 1: Raw HTTP with preemptive Basic auth");
+                    if (RunRawHttpTest(settings, serverEndpoint) == 0)
+                        rawHttpPasses++;
+                    else
+                        rawHttpFailures++;
+                    Log("");
+
+                    // Test 2: WebAPI subclass
+                    Log("  Test 2: WebAPI (PreemptiveBasicAuthProvider subclass)");
+                    if (RunWebApiSubclassTest(settings, serverEndpoint) == 0)
+                        webApiPasses++;
+                    else
+                        webApiFailures++;
+                    Log("");
+
+                    if (i < iterations)
+                    {
+                        Log($"  Waiting {delaySeconds}s...");
+                        Thread.Sleep(delaySeconds * 1000);
+                    }
+                }
+
+                // Summary
+                Log("════════════════════════════════════════════════════════════════");
+                Log("SUMMARY");
+                Log("════════════════════════════════════════════════════════════════");
+                Log($"  Test 1 (Raw HTTP):      Passes: {rawHttpPasses}/{iterations}  Failures: {rawHttpFailures}/{iterations}");
+                Log($"  Test 2 (WebAPI subclass): Passes: {webApiPasses}/{iterations}  Failures: {webApiFailures}/{iterations}");
+                var totalFailures = rawHttpFailures + webApiFailures;
+                Log($"  Result:   {(totalFailures == 0 ? "ALL PASSED" : $"{totalFailures} FAILED")}");
+                Log("");
+
+                return totalFailures > 0 ? 1 : 0;
+            }
+            finally
+            {
+                _log?.Dispose();
+            }
         }
 
         // ─────────────────────────────────────────────────────────────
         // Test 1: Raw HTTP — no Blackbaud DLLs needed
         // ─────────────────────────────────────────────────────────────
-        static int RunRawHttpTest(Settings settings)
+        static int RunRawHttpTest(Settings settings, IPEndPoint serverEndpoint)
         {
+            var sw = Stopwatch.StartNew();
+
             try
             {
-                var soapBody = BuildDataListGetMetaDataEnvelope(settings.Database);
+                Log("  >> DataListGetMetaData (Phones List)");
 
-                Console.WriteLine("Calling DataListGetMetaData...");
+                var soapBody = BuildDataListGetMetaDataEnvelope(settings.Database);
 
                 var request = (HttpWebRequest)WebRequest.Create(settings.ServiceUrl);
                 request.Method = "POST";
                 request.ContentType = "text/xml; charset=utf-8";
                 request.Headers.Add("SOAPAction", "\"Blackbaud.AppFx.WebService.API.1/DataListGetMetaData\"");
 
+                if (!string.IsNullOrEmpty(settings.ProxyUrl))
+                    request.Proxy = new WebProxy(settings.ProxyUrl);
+
                 // Preemptive Basic auth — send credentials on first request
                 var credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes(
-                    string.IsNullOrEmpty(settings.Domain)
-                        ? $"{settings.Username}:{settings.Password}"
-                        : $"{settings.Domain}\\{settings.Username}:{settings.Password}"));
+                    $"{settings.Username}:{settings.Password}"));
                 request.Headers.Add("Authorization", $"Basic {credentials}");
 
                 var bodyBytes = Encoding.UTF8.GetBytes(soapBody);
@@ -65,22 +153,85 @@ namespace InfinityAuthNiuTest
                 using (var stream = request.GetRequestStream())
                     stream.Write(bodyBytes, 0, bodyBytes.Length);
 
+                // Log request
+                Log("  Request:");
+                Log($"     {request.Method} {request.RequestUri}");
+                foreach (string header in request.Headers)
+                {
+                    var val = request.Headers[header];
+                    if (val != null && val.Length > 200)
+                        val = val.Substring(0, 200) + "...";
+                    Log($"     {header}: {val}");
+                }
+
                 using (var response = (HttpWebResponse)request.GetResponse())
                 using (var reader = new StreamReader(response.GetResponseStream()))
                 {
                     var responseText = reader.ReadToEnd();
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"PASS - HTTP {(int)response.StatusCode} {response.StatusDescription}");
-                    Console.ResetColor();
-                    Console.WriteLine($"Response (first 500 chars): {responseText.Substring(0, Math.Min(500, responseText.Length))}");
+                    sw.Stop();
+
+                    Log($"  << 200 OK ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Green);
+
+                    // Log response
+                    Log("  Response:");
+                    Log($"     Status: {(int)response.StatusCode} {response.StatusDescription}");
+                    if (!string.IsNullOrEmpty(response.Server))
+                        Log($"     Server: {response.Server}");
+                    foreach (string header in response.Headers)
+                    {
+                        var val = response.Headers[header];
+                        if (val != null && val.Length > 200)
+                            val = val.Substring(0, 200) + "...";
+                        Log($"     {header}: {val}");
+                    }
+
+                    Log($"  Response Body (first 500 chars): {responseText.Substring(0, Math.Min(500, responseText.Length))}");
+                    LogSourcePort(serverEndpoint);
                 }
                 return 0;
             }
+            catch (WebException webEx)
+            {
+                sw.Stop();
+                if (webEx.Response is HttpWebResponse resp)
+                {
+                    Log($"  << HTTP {(int)resp.StatusCode} {resp.StatusDescription} ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Red);
+                    Log("  Response:");
+                    Log($"     Status: {(int)resp.StatusCode} {resp.StatusDescription}");
+                    foreach (string header in resp.Headers)
+                    {
+                        var val = resp.Headers[header];
+                        if (val != null && val.Length > 200)
+                            val = val.Substring(0, 200) + "...";
+                        Log($"     {header}: {val}");
+                    }
+                    try
+                    {
+                        using (var reader = new StreamReader(resp.GetResponseStream()))
+                        {
+                            var body = reader.ReadToEnd();
+                            if (!string.IsNullOrWhiteSpace(body))
+                                Log($"  Response Body: {body.Substring(0, Math.Min(500, body.Length))}");
+                        }
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Log($"  << WebException ({sw.ElapsedMilliseconds}ms): {webEx.Status} — {webEx.Message}", ConsoleColor.Red);
+                    if (webEx.InnerException != null)
+                        Log($"     Inner: {webEx.InnerException.GetType().Name}: {webEx.InnerException.Message}");
+                }
+                LogSourcePort(serverEndpoint);
+                return 1;
+            }
             catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL - {FormatException(ex)}");
-                Console.ResetColor();
+                sw.Stop();
+                Log($"  << EXCEPTION ({sw.ElapsedMilliseconds}ms): {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
+                if (ex.InnerException != null)
+                    Log($"     Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+                LogSourcePort(serverEndpoint);
                 return 1;
             }
         }
@@ -88,98 +239,279 @@ namespace InfinityAuthNiuTest
         // ─────────────────────────────────────────────────────────────
         // Test 2: WebAPI with subclassed provider/proxy
         // ─────────────────────────────────────────────────────────────
-        static int RunWebApiSubclassTest(Settings settings)
+        static int RunWebApiSubclassTest(Settings settings, IPEndPoint serverEndpoint)
         {
+            var sw = Stopwatch.StartNew();
+
             try
             {
-                var provider = new PreemptiveBasicAuthProvider(
-                    settings.Username, settings.Password, settings.Domain);
+                Log("  >> GetAvailableREDatabases via WebAPI");
+
+                var diagService = new DiagnosticPreemptiveBasicAuthWebService(
+                    settings.Username, settings.Password);
+
+                var provider = new DiagnosticPreemptiveBasicAuthProvider(diagService);
                 provider.Url = settings.ServiceUrl;
                 provider.Database = settings.Database;
                 provider.ApplicationName = "InfinityAuthNiuTest";
-
-                Console.WriteLine("Calling GetAvailableREDatabases via WebAPI...");
+                provider.ProxyUrl = settings.ProxyUrl;
 
                 var req = provider.CreateRequest<GetAvailableREDatabasesRequest>();
                 var reply = provider.Service.GetAvailableREDatabases(req);
+                sw.Stop();
 
                 if (reply.Databases == null || reply.Databases.Length == 0)
                 {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine("PASS - connected, but no databases returned.");
-                    Console.ResetColor();
-                    return 0;
+                    Log($"  << 200 OK — no databases returned ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Yellow);
+                }
+                else
+                {
+                    Log($"  << 200 OK — {reply.Databases.Length} database(s) ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Green);
+                    foreach (var db in reply.Databases)
+                        Log($"     {db}");
                 }
 
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"PASS - {reply.Databases.Length} database(s):");
-                Console.ResetColor();
-                foreach (var db in reply.Databases)
-                    Console.WriteLine($"  {db}");
-
+                LogDiagRequest(diagService);
+                LogDiagResponse(diagService);
+                LogSourcePort(serverEndpoint);
                 return 0;
+            }
+            catch (SoapException soapEx)
+            {
+                sw.Stop();
+                Log($"  << SOAP ERROR ({sw.ElapsedMilliseconds}ms): {soapEx.Message}", ConsoleColor.Red);
+                LogSourcePort(serverEndpoint);
+                return 1;
+            }
+            catch (WebException webEx)
+            {
+                sw.Stop();
+                if (webEx.Response is HttpWebResponse resp)
+                {
+                    Log($"  << HTTP {(int)resp.StatusCode} {resp.StatusDescription} ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Red);
+                    Log("  Response:");
+                    Log($"     Status: {(int)resp.StatusCode} {resp.StatusDescription}");
+                    foreach (string header in resp.Headers)
+                    {
+                        var val = resp.Headers[header];
+                        if (val != null && val.Length > 200)
+                            val = val.Substring(0, 200) + "...";
+                        Log($"     {header}: {val}");
+                    }
+                    try
+                    {
+                        using (var reader = new StreamReader(resp.GetResponseStream()))
+                        {
+                            var body = reader.ReadToEnd();
+                            if (!string.IsNullOrWhiteSpace(body))
+                                Log($"  Response Body: {body.Substring(0, Math.Min(500, body.Length))}");
+                        }
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Log($"  << WebException ({sw.ElapsedMilliseconds}ms): {webEx.Status} — {webEx.Message}", ConsoleColor.Red);
+                    if (webEx.InnerException != null)
+                        Log($"     Inner: {webEx.InnerException.GetType().Name}: {webEx.InnerException.Message}");
+                }
+                LogSourcePort(serverEndpoint);
+                return 1;
             }
             catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL - {FormatException(ex)}");
-                Console.ResetColor();
+                sw.Stop();
+                Log($"  << EXCEPTION ({sw.ElapsedMilliseconds}ms): {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
+                if (ex.InnerException != null)
+                    Log($"     Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+                LogSourcePort(serverEndpoint);
                 return 1;
             }
         }
 
         // ─────────────────────────────────────────────────────────────
-        // Subclasses that inject preemptive Basic auth
+        // Diagnostic subclass — preemptive Basic auth + header capture
         // ─────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Subclass of AppFxWebService that overrides GetWebRequest to inject
-        /// a preemptive Authorization: Basic header on every request.
-        /// This avoids the challenge-response flow that fails through App Gateway v2.
-        /// </summary>
-        class PreemptiveBasicAuthWebService : AppFxWebService
+        class DiagnosticPreemptiveBasicAuthWebService : AppFxWebService
         {
             readonly string _authHeader;
 
-            public PreemptiveBasicAuthWebService(string username, string password, string domain)
+            public WebHeaderCollection LastRequestHeaders { get; private set; }
+            public WebHeaderCollection LastResponseHeaders { get; private set; }
+            public string LastRequestMethod { get; private set; }
+            public Uri LastRequestUri { get; private set; }
+            public HttpStatusCode? LastResponseStatus { get; private set; }
+            public string LastResponseServer { get; private set; }
+
+            public DiagnosticPreemptiveBasicAuthWebService(string username, string password)
             {
-                var userPart = string.IsNullOrEmpty(domain)
-                    ? username
-                    : $"{domain}\\{username}";
                 _authHeader = "Basic " + Convert.ToBase64String(
-                    Encoding.ASCII.GetBytes($"{userPart}:{password}"));
+                    Encoding.ASCII.GetBytes($"{username}:{password}"));
             }
 
             protected override WebRequest GetWebRequest(Uri uri)
             {
                 var request = base.GetWebRequest(uri);
                 request.Headers["Authorization"] = _authHeader;
+                LastRequestUri = uri;
+                LastResponseHeaders = null;
+                LastResponseStatus = null;
+                LastResponseServer = null;
+
+                if (request is HttpWebRequest httpReq)
+                {
+                    LastRequestMethod = httpReq.Method;
+                    LastRequestHeaders = httpReq.Headers;
+                }
+
                 return request;
+            }
+
+            protected override WebResponse GetWebResponse(WebRequest request)
+            {
+                var response = base.GetWebResponse(request);
+                CaptureResponse(response);
+                return response;
+            }
+
+            protected override WebResponse GetWebResponse(WebRequest request, IAsyncResult result)
+            {
+                var response = base.GetWebResponse(request, result);
+                CaptureResponse(response);
+                return response;
+            }
+
+            void CaptureResponse(WebResponse response)
+            {
+                if (response is HttpWebResponse httpResp)
+                {
+                    LastResponseHeaders = httpResp.Headers;
+                    LastResponseStatus = httpResp.StatusCode;
+                    LastResponseServer = httpResp.Server;
+                }
             }
         }
 
-        /// <summary>
-        /// Subclass of AppFxWebServiceProvider that overrides CreateAppFxWebService
-        /// to return a PreemptiveBasicAuthWebService instead of the default proxy.
-        /// </summary>
-        class PreemptiveBasicAuthProvider : AppFxWebServiceProvider
+        class DiagnosticPreemptiveBasicAuthProvider : AppFxWebServiceProvider
         {
-            readonly string _username;
-            readonly string _password;
-            readonly string _domain;
+            readonly DiagnosticPreemptiveBasicAuthWebService _svc;
 
-            public PreemptiveBasicAuthProvider(string username, string password, string domain)
+            public DiagnosticPreemptiveBasicAuthProvider(DiagnosticPreemptiveBasicAuthWebService svc)
             {
-                _username = username;
-                _password = password;
-                _domain = domain;
+                _svc = svc;
             }
+
+            public string ProxyUrl { get; set; }
 
             public override AppFxWebService CreateAppFxWebService()
             {
-                var svc = new PreemptiveBasicAuthWebService(_username, _password, _domain);
-                svc.Url = this.Url;
-                return svc;
+                _svc.Url = this.Url;
+
+                if (!string.IsNullOrEmpty(ProxyUrl))
+                    _svc.Proxy = new WebProxy(ProxyUrl);
+
+                return _svc;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Unified logging — same format as InfinityAuthWebApiTest
+        // ─────────────────────────────────────────────────────────────
+
+        static void LogDiagRequest(DiagnosticPreemptiveBasicAuthWebService svc)
+        {
+            Log("  Request:");
+            if (svc.LastRequestUri != null)
+                Log($"     {svc.LastRequestMethod ?? "POST"} {svc.LastRequestUri}");
+
+            if (svc.LastRequestHeaders != null)
+            {
+                foreach (string header in svc.LastRequestHeaders)
+                {
+                    var val = svc.LastRequestHeaders[header];
+                    if (val != null && val.Length > 200)
+                        val = val.Substring(0, 200) + "...";
+                    Log($"     {header}: {val}");
+                }
+            }
+            else
+            {
+                Log("     (request headers not captured)");
+            }
+        }
+
+        static void LogDiagResponse(DiagnosticPreemptiveBasicAuthWebService svc)
+        {
+            Log("  Response:");
+            if (svc.LastResponseHeaders != null)
+            {
+                if (svc.LastResponseStatus.HasValue)
+                    Log($"     Status: {(int)svc.LastResponseStatus.Value} {svc.LastResponseStatus.Value}");
+                if (!string.IsNullOrEmpty(svc.LastResponseServer))
+                    Log($"     Server: {svc.LastResponseServer}");
+                foreach (string header in svc.LastResponseHeaders)
+                {
+                    var val = svc.LastResponseHeaders[header];
+                    if (val != null && val.Length > 200)
+                        val = val.Substring(0, 200) + "...";
+                    Log($"     {header}: {val}");
+                }
+            }
+            else
+            {
+                Log("     (response headers not captured via diagnostic proxy — see above for WebException details)");
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Source port logging — find active TCP connection to server
+        // ─────────────────────────────────────────────────────────────
+
+        static IPEndPoint ResolveServerEndpoint(string hostname)
+        {
+            try
+            {
+                var entry = Dns.GetHostEntry(hostname);
+                var ip = entry.AddressList.FirstOrDefault();
+                if (ip != null)
+                    return new IPEndPoint(ip, 443);
+            }
+            catch { }
+            return null;
+        }
+
+        static void LogSourcePort(IPEndPoint serverEndpoint)
+        {
+            if (serverEndpoint == null)
+            {
+                Log("  Source Port: (server endpoint unknown)");
+                return;
+            }
+
+            try
+            {
+                var connections = IPGlobalProperties.GetIPGlobalProperties()
+                    .GetActiveTcpConnections()
+                    .Where(c => c.RemoteEndPoint.Address.Equals(serverEndpoint.Address)
+                             && c.RemoteEndPoint.Port == serverEndpoint.Port)
+                    .ToArray();
+
+                if (connections.Length > 0)
+                {
+                    foreach (var conn in connections)
+                    {
+                        Log($"  Source Port: {conn.LocalEndPoint.Port} → {conn.RemoteEndPoint} (State: {conn.State})");
+                    }
+                }
+                else
+                {
+                    Log("  Source Port: (no active TCP connection to server — connection already closed)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"  Source Port: (unable to determine: {ex.Message})");
             }
         }
 
@@ -204,13 +536,68 @@ namespace InfinityAuthNiuTest
 </soap:Envelope>";
         }
 
-        static string FormatException(Exception ex)
+        static void Log(string message, ConsoleColor? color = null)
         {
-            if (ex is WebException webEx && webEx.Response is HttpWebResponse resp)
-                return $"HTTP {(int)resp.StatusCode} {resp.StatusDescription}";
-            if (ex is SoapException soapEx)
-                return $"SOAP error: {soapEx.Message}";
-            return $"{ex.GetType().Name}: {ex.Message}";
+            var timestamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
+
+            _log.WriteLine(timestamped);
+
+            if (color.HasValue)
+                Console.ForegroundColor = color.Value;
+            Console.WriteLine(timestamped);
+            if (color.HasValue)
+                Console.ResetColor();
+        }
+
+        static string GetPublicIp()
+        {
+            try
+            {
+                using (var client = new WebClient())
+                    return client.DownloadString("https://api.ipify.org").Trim();
+            }
+            catch (Exception ex)
+            {
+                return $"(unable to determine: {ex.Message})";
+            }
+        }
+
+        static string GetLocalIps()
+        {
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                var ips = host.AddressList
+                    .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    .Select(a => a.ToString())
+                    .ToArray();
+                return ips.Length > 0 ? string.Join(", ", ips) : "(none)";
+            }
+            catch
+            {
+                return "(unable to determine)";
+            }
+        }
+
+        static string ResolveHost(string hostname)
+        {
+            try
+            {
+                var entry = Dns.GetHostEntry(hostname);
+                var ips = entry.AddressList
+                    .Select(a => a.ToString())
+                    .ToArray();
+                return ips.Length > 0 ? string.Join(", ", ips) : "(no addresses)";
+            }
+            catch (Exception ex)
+            {
+                return $"(unable to resolve: {ex.Message})";
+            }
+        }
+
+        static string FormatUser(Settings settings)
+        {
+            return settings.Username;
         }
 
         static Settings LoadSettings()
@@ -225,13 +612,6 @@ namespace InfinityAuthNiuTest
             var json = File.ReadAllText(configPath);
             return new Settings(json);
         }
-
-        static string FormatUser(Settings settings)
-        {
-            return string.IsNullOrEmpty(settings.Domain)
-                ? settings.Username
-                : $"{settings.Domain}\\{settings.Username}";
-        }
     }
 
     class Settings
@@ -240,7 +620,7 @@ namespace InfinityAuthNiuTest
         public string Database { get; }
         public string Username { get; }
         public string Password { get; }
-        public string Domain { get; }
+        public string ProxyUrl { get; }
 
         public Settings(string json)
         {
@@ -248,7 +628,7 @@ namespace InfinityAuthNiuTest
             Database = Extract(json, "Database");
             Username = Extract(json, "Username");
             Password = Extract(json, "Password");
-            Domain = Extract(json, "Domain");
+            ProxyUrl = Extract(json, "ProxyUrl");
         }
 
         static string Extract(string json, string key)
