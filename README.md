@@ -1,8 +1,72 @@
 # InfinityAuthNiuTest
 
-Tests Basic authentication against a canary Infinity instance using raw HTTP with preemptive Basic auth and NIU (Non Interactive User) credentials.
+Demonstrates two workarounds for the NTLM/Basic auth failure through Azure App Gateway v2, both using preemptive `Authorization: Basic` headers.
 
-This app deliberately avoids the `Blackbaud.AppFx.WebAPI` library to isolate an authentication issue: `SoapHttpClientProtocol` uses challenge-response auth (waits for a 401 before sending credentials), which fails through App Gateway v2 because the gateway resets the TCP connection between handshake legs. Sending the `Authorization: Basic` header preemptively on the first request — as Postman does — works correctly.
+## The Problem
+
+`SoapHttpClientProtocol` (the base class of `AppFxWebService`) uses challenge-response auth — it sends the first request with no credentials, waits for a 401 + `WWW-Authenticate` challenge, then retries. App Gateway v2 sends `Connection: close` after the 401, breaking the retry. The proxy gives up and the call fails.
+
+Sending the `Authorization: Basic` header preemptively on the first request — as Postman does — bypasses the challenge-response flow entirely and succeeds.
+
+## What This App Does
+
+Runs two tests against the same endpoint:
+
+### Test 1: Raw HTTP (no Blackbaud DLLs)
+
+Sends a hand-built SOAP envelope (`DataListGetMetaData` for the Phones List) via `HttpWebRequest` with a preemptive Basic auth header. This isolates the fix to pure .NET Framework classes with no dependencies.
+
+### Test 2: WebAPI with subclassed provider
+
+Uses the `Blackbaud.AppFx.WebAPI` library with two subclasses that inject preemptive Basic auth:
+
+- **`PreemptiveBasicAuthWebService`** — subclasses `AppFxWebService` (the generated SOAP proxy) and overrides `GetWebRequest()` to add the `Authorization: Basic` header on every request.
+- **`PreemptiveBasicAuthProvider`** — subclasses `AppFxWebServiceProvider` and overrides the virtual `CreateAppFxWebService()` to return the custom proxy.
+
+This approach preserves the full WebAPI experience (`CreateRequest<T>`, session management, typed requests/replies) while fixing the auth problem. It demonstrates a drop-in fix for SDK consumers.
+
+```csharp
+// The fix — two small subclasses:
+class PreemptiveBasicAuthWebService : AppFxWebService
+{
+    readonly string _authHeader;
+
+    public PreemptiveBasicAuthWebService(string username, string password, string domain)
+    {
+        var userPart = string.IsNullOrEmpty(domain) ? username : $"{domain}\\{username}";
+        _authHeader = "Basic " + Convert.ToBase64String(
+            Encoding.ASCII.GetBytes($"{userPart}:{password}"));
+    }
+
+    protected override WebRequest GetWebRequest(Uri uri)
+    {
+        var request = base.GetWebRequest(uri);
+        request.Headers["Authorization"] = _authHeader;
+        return request;
+    }
+}
+
+class PreemptiveBasicAuthProvider : AppFxWebServiceProvider
+{
+    readonly string _username, _password, _domain;
+
+    public PreemptiveBasicAuthProvider(string username, string password, string domain)
+    {
+        _username = username; _password = password; _domain = domain;
+    }
+
+    public override AppFxWebService CreateAppFxWebService()
+    {
+        var svc = new PreemptiveBasicAuthWebService(_username, _password, _domain);
+        svc.Url = this.Url;
+        return svc;
+    }
+}
+```
+
+## Prerequisites
+
+Basic authentication must be enabled in IIS on the target AppFxWebService endpoint. If only Windows authentication (NTLM/Negotiate) is enabled, the server will ignore the Basic header.
 
 ## What is an NIU / Proxy User?
 
@@ -18,27 +82,21 @@ To create a proxy user: navigate to the Application Users page, select "Add Prox
 
 For full documentation, see: [CRM Service Pack 32 — Proxy User](https://webfiles-sc1.blackbaud.com/files/support/helpfiles/crm/us/40/Content/service_packs/crm-service-pack-32.html)
 
-## What This App Does
-
-Sends a raw SOAP request (`DataListGetMetaData` for the Phones List) via `HttpWebRequest` with a preemptive `Authorization: Basic` header. No Blackbaud-specific DLLs are used — only standard .NET Framework classes.
-
-The `appsettings.json` `Username` field is the proxy user name and `Password` is the PAT.
-
 ## Configuration
 
-Edit `appsettings.json` with your NIU proxy username and PAT:
+Edit `appsettings.json`:
 
 ```json
 {
   "ServiceUrl": "https://crm5740s29.sky.blackbaud.com/5740S29/appfxwebservice.asmx",
   "Database": "5740S29",
-  "Username": "<proxy username>",
-  "Password": "<PAT>",
-  "Domain": ""
+  "Username": "<username>",
+  "Password": "<password or PAT>",
+  "Domain": "<domain or empty for NIU>"
 }
 ```
 
-Note: `Domain` should be empty for NIU/proxy users — they authenticate via Basic auth with a PAT, not Windows domain credentials.
+Works with both domain credentials (`Domain` = `"s29"`) and NIU/proxy credentials (`Domain` = `""`).
 
 ## Build & Run
 

@@ -2,7 +2,9 @@ using System;
 using System.IO;
 using System.Net;
 using System.Text;
-using System.Xml;
+using System.Web.Services.Protocols;
+using Blackbaud.AppFx.WebAPI;
+using Blackbaud.AppFx.WebAPI.ServiceProxy;
 
 namespace InfinityAuthNiuTest
 {
@@ -10,29 +12,48 @@ namespace InfinityAuthNiuTest
     {
         static int Main(string[] args)
         {
+            var settings = LoadSettings();
+
+            Console.WriteLine($"URL:      {settings.ServiceUrl}");
+            Console.WriteLine($"Database: {settings.Database}");
+            Console.WriteLine($"User:     {FormatUser(settings)}");
+            Console.WriteLine();
+
+            int result = 0;
+
+            // Test 1: Raw HTTP with preemptive Basic auth
+            Console.WriteLine("════════════════════════════════════════════════════════════════");
+            Console.WriteLine("Test 1: Raw HTTP with preemptive Basic auth");
+            Console.WriteLine("════════════════════════════════════════════════════════════════");
+            result |= RunRawHttpTest(settings);
+            Console.WriteLine();
+
+            // Test 2: WebAPI with PreemptiveBasicAuthProvider subclass
+            Console.WriteLine("════════════════════════════════════════════════════════════════");
+            Console.WriteLine("Test 2: WebAPI (PreemptiveBasicAuthProvider subclass)");
+            Console.WriteLine("════════════════════════════════════════════════════════════════");
+            result |= RunWebApiSubclassTest(settings);
+
+            return result;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Test 1: Raw HTTP — no Blackbaud DLLs needed
+        // ─────────────────────────────────────────────────────────────
+        static int RunRawHttpTest(Settings settings)
+        {
             try
             {
-                var settings = LoadSettings();
-
-                Console.WriteLine($"URL:      {settings.ServiceUrl}");
-                Console.WriteLine($"Database: {settings.Database}");
-                Console.WriteLine($"User:     {FormatUser(settings)}");
-                Console.WriteLine($"Auth:     Basic (preemptive)");
-                Console.WriteLine();
-
-                // Build SOAP envelope for DataListGetMetaData
                 var soapBody = BuildDataListGetMetaDataEnvelope(settings.Database);
 
-                Console.WriteLine("Calling DataListGetMetaData (raw HTTP, preemptive Basic auth)...");
-                Console.WriteLine($"SOAPAction: Blackbaud.AppFx.WebService.API.1/DataListGetMetaData");
-                Console.WriteLine();
+                Console.WriteLine("Calling DataListGetMetaData...");
 
                 var request = (HttpWebRequest)WebRequest.Create(settings.ServiceUrl);
                 request.Method = "POST";
                 request.ContentType = "text/xml; charset=utf-8";
                 request.Headers.Add("SOAPAction", "\"Blackbaud.AppFx.WebService.API.1/DataListGetMetaData\"");
 
-                // Preemptive Basic auth — send credentials on first request, no challenge needed
+                // Preemptive Basic auth — send credentials on first request
                 var credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes(
                     string.IsNullOrEmpty(settings.Domain)
                         ? $"{settings.Username}:{settings.Password}"
@@ -48,47 +69,126 @@ namespace InfinityAuthNiuTest
                 using (var reader = new StreamReader(response.GetResponseStream()))
                 {
                     var responseText = reader.ReadToEnd();
-
                     Console.ForegroundColor = ConsoleColor.Green;
                     Console.WriteLine($"PASS - HTTP {(int)response.StatusCode} {response.StatusDescription}");
                     Console.ResetColor();
-                    Console.WriteLine();
-                    Console.WriteLine("Response (first 2000 chars):");
-                    Console.WriteLine(responseText.Substring(0, Math.Min(2000, responseText.Length)));
+                    Console.WriteLine($"Response (first 500 chars): {responseText.Substring(0, Math.Min(500, responseText.Length))}");
                 }
-
                 return 0;
-            }
-            catch (WebException webEx)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.Write("FAIL - ");
-                if (webEx.Response is HttpWebResponse resp)
-                {
-                    Console.WriteLine($"HTTP {(int)resp.StatusCode} {resp.StatusDescription}");
-                    using (var reader = new StreamReader(resp.GetResponseStream()))
-                        Console.WriteLine(reader.ReadToEnd().Substring(0, Math.Min(2000, (int)resp.ContentLength > 0 ? (int)resp.ContentLength : 2000)));
-                }
-                else
-                {
-                    Console.WriteLine(webEx.Message);
-                }
-                Console.ResetColor();
-                return 1;
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL - {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"FAIL - {FormatException(ex)}");
                 Console.ResetColor();
                 return 1;
             }
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // Test 2: WebAPI with subclassed provider/proxy
+        // ─────────────────────────────────────────────────────────────
+        static int RunWebApiSubclassTest(Settings settings)
+        {
+            try
+            {
+                var provider = new PreemptiveBasicAuthProvider(
+                    settings.Username, settings.Password, settings.Domain);
+                provider.Url = settings.ServiceUrl;
+                provider.Database = settings.Database;
+                provider.ApplicationName = "InfinityAuthNiuTest";
+
+                Console.WriteLine("Calling GetAvailableREDatabases via WebAPI...");
+
+                var req = provider.CreateRequest<GetAvailableREDatabasesRequest>();
+                var reply = provider.Service.GetAvailableREDatabases(req);
+
+                if (reply.Databases == null || reply.Databases.Length == 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("PASS - connected, but no databases returned.");
+                    Console.ResetColor();
+                    return 0;
+                }
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"PASS - {reply.Databases.Length} database(s):");
+                Console.ResetColor();
+                foreach (var db in reply.Databases)
+                    Console.WriteLine($"  {db}");
+
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"FAIL - {FormatException(ex)}");
+                Console.ResetColor();
+                return 1;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Subclasses that inject preemptive Basic auth
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Subclass of AppFxWebService that overrides GetWebRequest to inject
+        /// a preemptive Authorization: Basic header on every request.
+        /// This avoids the challenge-response flow that fails through App Gateway v2.
+        /// </summary>
+        class PreemptiveBasicAuthWebService : AppFxWebService
+        {
+            readonly string _authHeader;
+
+            public PreemptiveBasicAuthWebService(string username, string password, string domain)
+            {
+                var userPart = string.IsNullOrEmpty(domain)
+                    ? username
+                    : $"{domain}\\{username}";
+                _authHeader = "Basic " + Convert.ToBase64String(
+                    Encoding.ASCII.GetBytes($"{userPart}:{password}"));
+            }
+
+            protected override WebRequest GetWebRequest(Uri uri)
+            {
+                var request = base.GetWebRequest(uri);
+                request.Headers["Authorization"] = _authHeader;
+                return request;
+            }
+        }
+
+        /// <summary>
+        /// Subclass of AppFxWebServiceProvider that overrides CreateAppFxWebService
+        /// to return a PreemptiveBasicAuthWebService instead of the default proxy.
+        /// </summary>
+        class PreemptiveBasicAuthProvider : AppFxWebServiceProvider
+        {
+            readonly string _username;
+            readonly string _password;
+            readonly string _domain;
+
+            public PreemptiveBasicAuthProvider(string username, string password, string domain)
+            {
+                _username = username;
+                _password = password;
+                _domain = domain;
+            }
+
+            public override AppFxWebService CreateAppFxWebService()
+            {
+                var svc = new PreemptiveBasicAuthWebService(_username, _password, _domain);
+                svc.Url = this.Url;
+                return svc;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Helpers
+        // ─────────────────────────────────────────────────────────────
+
         static string BuildDataListGetMetaDataEnvelope(string database)
         {
-            // Minimal DataListGetMetaData request — just needs a valid DataListID
-            // Using a well-known list ID (constituent search) as a test
             return $@"<?xml version=""1.0"" encoding=""utf-8""?>
 <soap:Envelope xmlns:soap=""http://schemas.xmlsoap.org/soap/envelope/""
                xmlns:bb=""Blackbaud.AppFx.WebService.API.1"">
@@ -102,6 +202,15 @@ namespace InfinityAuthNiuTest
     </bb:DataListGetMetaDataRequest>
   </soap:Body>
 </soap:Envelope>";
+        }
+
+        static string FormatException(Exception ex)
+        {
+            if (ex is WebException webEx && webEx.Response is HttpWebResponse resp)
+                return $"HTTP {(int)resp.StatusCode} {resp.StatusDescription}";
+            if (ex is SoapException soapEx)
+                return $"SOAP error: {soapEx.Message}";
+            return $"{ex.GetType().Name}: {ex.Message}";
         }
 
         static Settings LoadSettings()

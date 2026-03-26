@@ -25,8 +25,22 @@
     <DefineConstants>TRACE</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="Blackbaud.AppFx.WebAPI">
+      <HintPath>..\Products\Platform\MAIN\DLLReferences\Blackbaud.AppFx.WebAPI.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Blackbaud.AppFx.XmlTypes">
+      <HintPath>..\Products\Platform\MAIN\DLLReferences\Blackbaud.AppFx.XmlTypes.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Blackbaud.AppFx.XmlTypes.XmlSerializers">
+      <HintPath>..\Products\Platform\MAIN\DLLReferences\Blackbaud.AppFx.XmlTypes.XmlSerializers.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.Web" />
+    <Reference Include="System.Web.Services" />
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
